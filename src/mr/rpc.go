@@ -6,24 +6,49 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"errors"
+	"os"
+	"strconv"
+)
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+var (
+	ErrCoordinatorTO = errors.New("coordinator timeout")
+)
 
-type ExampleArgs struct {
-	X int
+const (
+	TaskTypMap = iota
+	TaskTypReduce
+	TaskTypWait
+	TaskTypDone
+)
+
+type TaskTyp int
+
+type Task struct {
+	Typ TaskTyp
+	ID  int
+
+	MapFile string
+
+	NMaps   int
+	NReduce int
 }
 
-type ExampleReply struct {
-	Y int
+const (
+	TaskResultOk = iota
+	TaskResultFailed
+)
+
+type TaskResult struct {
+	Typ    TaskTyp
+	ID     int
+	Result int
 }
 
-// Add your RPC definitions here.
+type TaskReq struct{}
 
+type TaskAck struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

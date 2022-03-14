@@ -41,7 +41,7 @@ const (
 
 var (
 	electionTO        = time.Duration(1) * time.Second
-	heartbeatTimeSpan = time.Duration(150) * time.Millisecond
+	heartbeatTimeSpan = time.Duration(100) * time.Millisecond
 )
 
 //
@@ -492,7 +492,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.term
 	reply.Success = false
 	reply.ConflictTerm = -1
-	reply.ConflictIdx = rf.snapshotIdx + 1
 
 	if args.Term < rf.term {
 		rf.lf("received lower term %d vs %d. returning false", args.Term, rf.term)
@@ -517,6 +516,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.PrevLogIdx < rf.snapshotIdx {
+		reply.ConflictIdx = rf.snapshotIdx + 1
 		return
 	}
 
@@ -543,14 +543,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	i := args.PrevLogIdx + 1
 	for i < rf.lastLogIdx()+1 && j < len(args.Entries) {
 		if rf.idxTerm(i) != args.Entries[j].Term {
-			rf.lf("conflictive entry at idx %d. peer_term: %d leader_term: %d",
-				i, rf.idxTerm(i), args.Entries[j].Term)
+			rf.lf("conflictive entry at idx %d. peer_term: %d leader_term: %d. truncating log until idx; %d",
+				i, rf.idxTerm(i), args.Entries[j].Term, i)
+			rf.log = rf.log[:i-rf.offset()]
 			break
 		}
 		i++
 		j++
 	}
-	rf.log = rf.log[:i-rf.offset()]
 
 	// Append any new entries not already in the log
 	for ; j < len(args.Entries); j++ {
@@ -569,7 +569,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		for i := rf.lastAppliedIdx + 1; i <= rf.commitIdx; i++ {
-			rf.lf("applying cmd %v at idx %d to state machine", rf.log[i-rf.offset()].Command, i)
+			rf.lf("applying cmd %v at idx: %d to state machine", rf.log[i-rf.offset()].Command, i)
 			rf.applyCh <- ApplyMsg{
 				CommandValid: rf.log[i-rf.offset()].CommandValid,
 				Command:      rf.log[i-rf.offset()].Command,
@@ -623,6 +623,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command:      command,
 		CommandValid: true,
 	})
+	go rf.broadcastAppendEntries()
 	rf.persist()
 
 	rf.lf("start command received with value %v. logIdx is now: %d", command, rf.logIdx())
@@ -679,9 +680,9 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) startElection(timeRef time.Time) {
-	rf.l("starting election")
-
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.l("starting election")
 
 	// Because we lost the lock temporarily, verify
 	// that the time reference due to which the
@@ -705,68 +706,48 @@ func (rf *Raft) startElection(timeRef time.Time) {
 	votes := 1 // self vote
 	majority := len(rf.peers)/2 + 1
 
-	var wg sync.WaitGroup
-	replyCh := make(chan *RequestVoteReply, len(rf.peers)-1)
-
 	for i := range rf.peers {
 		if i != me {
 			rf.lf("sending vote request for peer %d", i)
-			wg.Add(1)
-			go func(wg *sync.WaitGroup, peer int, replyCh chan<- *RequestVoteReply) {
+			go func(peer int) {
 				reply := &RequestVoteReply{}
-				if ok := rf.sendRequestVote(peer, args, reply); ok {
-					replyCh <- reply
+				if ok := rf.sendRequestVote(peer, args, reply); !ok {
+					return
 				}
-				wg.Done()
-			}(&wg, i, replyCh)
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				rf.lf("received RequestVote RPC reply from peer: %d", peer)
+
+				// If peer term has changed during RPC
+				// calls then abort reading replies
+				if rf.term != args.Term {
+					return
+				}
+
+				if reply.VoteGranted {
+					rf.lf("received vote from peer: %d", peer)
+					votes++
+					if votes >= majority {
+						rf.isLeader = true
+						rf.isLeaderCond.Signal() // awake leader goroutine
+						return
+					}
+					// We could continue here and assume that
+					// term is correct due to vote being granted
+					// continue
+				}
+
+				if reply.Term > rf.term {
+					rf.term = reply.Term
+					rf.isLeader = false
+					rf.votedFor = -1
+					rf.persist()
+					return
+				}
+			}(i)
 		}
 	}
-
-	rf.mu.Unlock()
-
-	go func() {
-		wg.Wait()
-		close(replyCh)
-	}()
-
-	go func() {
-		for r := range replyCh {
-			rf.l("received RequestVote RPC reply")
-			rf.mu.Lock()
-
-			// If peer term has changed during RPC
-			// calls then abort reading replies
-			if rf.term != args.Term {
-				rf.mu.Unlock()
-				break
-			}
-
-			if r.VoteGranted {
-				rf.l("received vote")
-				votes++
-				if votes >= majority {
-					rf.isLeader = true
-					rf.isLeaderCond.Signal() // awake leader goroutine
-					rf.mu.Unlock()
-					break
-				}
-				// We could continue here and assume that
-				// term is correct due to vote being granted
-				// continue
-			}
-
-			if r.Term > rf.term {
-				rf.term = r.Term
-				rf.isLeader = false
-				rf.votedFor = -1
-				rf.persist()
-				rf.mu.Unlock()
-				break
-			}
-
-			rf.mu.Unlock()
-		}
-	}()
 }
 
 func (rf *Raft) startLeaderLoop() {
@@ -778,20 +759,6 @@ func (rf *Raft) startLeaderLoop() {
 		rf.mu.Lock()
 
 		if rf.isLeader {
-			rf.l("starting AppendEntries loop as leader")
-
-			type peerReply struct {
-				peer  int
-				reply *AppendEntriesReply
-			}
-
-			// Copy current leader logIdx so we get
-			// a reference for the entries sent to
-			// followers. This way we avoid rf.logIdx
-			// from being modified between AppendEntries
-			// RPCs and their responses
-			logIdx := rf.logIdx()
-
 			// Reset volatile state if just
 			// been reelected as leader
 			if reset {
@@ -802,115 +769,8 @@ func (rf *Raft) startLeaderLoop() {
 				reset = false
 			}
 
-			var wg sync.WaitGroup
-			var replyCh = make(chan peerReply)
-
-			for i := range rf.peers {
-				if i != rf.me {
-					peerNextIdx := rf.nextIdx[i]
-
-					// If peer's log is behind end of last snapshot,
-					// send complete snapshot instead of entries
-					if peerNextIdx <= rf.snapshotIdx {
-						rf.lf(
-							"sending InstallSnapshot RPC to peer %d. term: %d snapshotIdx: %d snapshotTerm: %d",
-							i, rf.term, rf.snapshotIdx, rf.snapshotTerm,
-						)
-						go rf.requestInstallSnapshot(i, InstallSnapshotArgs{
-							Term:             rf.term,
-							LeaderId:         rf.me,
-							LastIncludedIdx:  rf.snapshotIdx,
-							LastIncludedTerm: rf.snapshotTerm,
-							Data:             rf.persister.ReadSnapshot(),
-						})
-						continue
-					}
-
-					args := &AppendEntriesArgs{
-						Term:            rf.term,
-						LeaderID:        rf.me,
-						PrevLogIdx:      peerNextIdx - 1,
-						PrevLogTerm:     rf.idxTerm(peerNextIdx - 1),
-						LeaderCommitIdx: rf.commitIdx,
-					}
-					entries := rf.log[peerNextIdx-rf.offset():]
-					args.Entries = make([]LogEntry, len(entries))
-					copy(args.Entries, entries)
-
-					rf.lf(
-						"sending AppendEntries RPC to peer %d. term: %d prevTerm: %d prevIdx: %d entries: %d",
-						i, rf.term, args.PrevLogTerm, args.PrevLogIdx, len(args.Entries),
-					)
-
-					wg.Add(1)
-					go func(wg *sync.WaitGroup, peer int, replyCh chan<- peerReply) {
-						reply := &AppendEntriesReply{}
-						if ok := rf.sendAppendEntries(peer, args, reply); ok {
-							replyCh <- peerReply{peer: peer, reply: reply}
-						} else {
-							rf.lf("leader can not reach peer %d", peer)
-						}
-						wg.Done()
-					}(&wg, i, replyCh)
-				}
-			}
-
 			rf.mu.Unlock()
-
-			go func() {
-				wg.Wait()
-				close(replyCh)
-			}()
-
-			go func() {
-				for r := range replyCh {
-					rf.mu.Lock()
-					rf.lf("received AppendEntries RPC reply. term: %d success: %v", r.reply.Term, r.reply.Success)
-
-					if !rf.isLeader {
-						rf.mu.Unlock()
-						break
-					}
-
-					if r.reply.Success {
-						rf.nextIdx[r.peer] = logIdx
-						rf.matchIdx[r.peer] = logIdx - 1
-					} else {
-						if r.reply.Term > rf.term {
-							// Become follower
-							rf.term = r.reply.Term
-							rf.isLeader = false
-							rf.votedFor = -1
-							rf.persist()
-							rf.mu.Unlock()
-							break
-						} else if r.reply.ConflictTerm < 0 {
-							// Sent entries are previous to follower's snapshot or
-							// sent entries are posterior to follower's log so there
-							// are missing entries in between
-							rf.nextIdx[r.peer] = min(r.reply.ConflictIdx, rf.logIdx())
-							rf.matchIdx[r.peer] = rf.nextIdx[r.peer] - 1
-						} else {
-							// Try to find conflict term in leader log
-							nextIdx := rf.lastLogIdx()
-							for ; nextIdx > rf.snapshotIdx; nextIdx-- {
-								if rf.idxTerm(nextIdx) == r.reply.ConflictTerm {
-									break
-								}
-							}
-							// If not found, set peer nextIdx to conflictIdx
-							if nextIdx == rf.snapshotIdx {
-								rf.nextIdx[r.peer] = r.reply.ConflictIdx
-							} else {
-								rf.nextIdx[r.peer] = nextIdx
-							}
-							rf.matchIdx[r.peer] = rf.nextIdx[r.peer] - 1
-						}
-					}
-					rf.mu.Unlock()
-				}
-			}()
-
+			rf.broadcastAppendEntries()
 			time.Sleep(heartbeatTimeSpan)
 		} else {
 			rf.mu.Unlock()
@@ -922,6 +782,109 @@ func (rf *Raft) startLeaderLoop() {
 			rf.isLeaderCond.L.Unlock()
 			rf.l("is leader")
 			reset = true
+		}
+	}
+}
+
+func (rf *Raft) broadcastAppendEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if !rf.isLeader {
+		return
+	}
+
+	rf.l("broadcasting AppendEntries as leader")
+
+	for i := range rf.peers {
+		if i != rf.me {
+			peerNextIdx := rf.nextIdx[i]
+
+			// If peer's log is behind end of last snapshot,
+			// send complete snapshot instead of entries
+			if peerNextIdx <= rf.snapshotIdx {
+				rf.lf(
+					"sending InstallSnapshot RPC to peer %d. term: %d snapshotIdx: %d snapshotTerm: %d",
+					i, rf.term, rf.snapshotIdx, rf.snapshotTerm,
+				)
+				go rf.requestInstallSnapshot(i, InstallSnapshotArgs{
+					Term:             rf.term,
+					LeaderId:         rf.me,
+					LastIncludedIdx:  rf.snapshotIdx,
+					LastIncludedTerm: rf.snapshotTerm,
+					Data:             rf.persister.ReadSnapshot(),
+				})
+				continue
+			}
+
+			args := &AppendEntriesArgs{
+				Term:            rf.term,
+				LeaderID:        rf.me,
+				PrevLogIdx:      peerNextIdx - 1,
+				PrevLogTerm:     rf.idxTerm(peerNextIdx - 1),
+				LeaderCommitIdx: rf.commitIdx,
+			}
+			entries := rf.log[peerNextIdx-rf.offset():]
+			args.Entries = make([]LogEntry, len(entries))
+			copy(args.Entries, entries)
+
+			rf.lf(
+				"sending AppendEntries RPC to peer %d. term: %d prevTerm: %d prevIdx: %d entries: %d",
+				i, rf.term, args.PrevLogTerm, args.PrevLogIdx, len(args.Entries),
+			)
+
+			go func(peer, logIdx int) {
+				reply := &AppendEntriesReply{}
+				if ok := rf.sendAppendEntries(peer, args, reply); !ok {
+					rf.lf("leader can not reach peer %d", peer)
+					return
+				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				rf.lf("received AppendEntries RPC reply. peer: %d term: %d success: %v", peer, reply.Term, reply.Success)
+
+				if !rf.isLeader {
+					return
+				}
+
+				if reply.Success {
+					rf.nextIdx[peer] = logIdx
+					rf.matchIdx[peer] = logIdx - 1
+				} else {
+					if reply.Term > rf.term {
+						// Become follower
+						rf.term = reply.Term
+						rf.isLeader = false
+						rf.votedFor = -1
+						rf.persist()
+						return
+					} else if reply.ConflictTerm < 0 {
+						// Sent entries are previous to follower's snapshot or
+						// sent entries are posterior to follower's log so there
+						// are missing entries in between
+						rf.nextIdx[peer] = min(reply.ConflictIdx, rf.logIdx())
+						rf.matchIdx[peer] = rf.nextIdx[peer] - 1
+					} else {
+						// Try to find conflict term in leader log
+						nextIdx := rf.lastLogIdx()
+						for ; nextIdx > rf.snapshotIdx; nextIdx-- {
+							if rf.idxTerm(nextIdx) == reply.ConflictTerm {
+								break
+							}
+						}
+						// If not found, set peer nextIdx to conflictIdx
+						if nextIdx == rf.snapshotIdx {
+							rf.nextIdx[peer] = reply.ConflictIdx
+						} else {
+							rf.nextIdx[peer] = nextIdx
+						}
+						rf.matchIdx[peer] = rf.nextIdx[peer] - 1
+					}
+				}
+
+				rf.applyMssgs()
+			}(i, rf.logIdx()) // Copy logIdx reference for entries sent to followers
 		}
 	}
 }
@@ -952,35 +915,23 @@ func (rf *Raft) requestInstallSnapshot(peer int, args InstallSnapshotArgs) {
 	rf.nextIdx[peer] = rf.matchIdx[peer] + 1
 }
 
-func (rf *Raft) startApplyMssgLoop() {
-	rf.l("starting applyMssg loop")
-
-	for rf.killed() == false {
-		rf.mu.Lock()
-
-		if rf.isLeader {
-			// If maximum replicated index across most followers is higher than current
-			// leader commitIdx, then apply the "in between" entries to state machine
-			maxReplicatedIdx := rf.maxReplicatedIdx()
-			if maxReplicatedIdx > rf.lastAppliedIdx {
-				rf.lf("leader apply loop: applying entries from: %d to: %d", rf.lastAppliedIdx+1, maxReplicatedIdx)
-				for i := rf.lastAppliedIdx + 1; i <= maxReplicatedIdx; i++ {
-					rf.lf("leader apply loop: applying cmd: %v", rf.log[i-rf.offset()].Command)
-					rf.applyCh <- ApplyMsg{
-						CommandValid: rf.log[i-rf.offset()].CommandValid,
-						Command:      rf.log[i-rf.offset()].Command,
-						CommandIndex: i,
-					}
-				}
-				rf.commitIdx = maxReplicatedIdx
-				rf.lastAppliedIdx = maxReplicatedIdx
-			} else {
-				rf.lf("leader apply loop: no actions. maxReplicatedIdx: %d rf.commitIdx: %d", maxReplicatedIdx, rf.commitIdx)
+func (rf *Raft) applyMssgs() {
+	// If maximum replicated index across most followers is higher than current
+	// leader commitIdx, then apply the "in between" entries to state machine
+	if mxRIdx := rf.maxReplicatedIdx(); mxRIdx > rf.lastAppliedIdx {
+		rf.lf("leader apply mssgs: applying entries from: %d to: %d", rf.lastAppliedIdx+1, mxRIdx)
+		for i := rf.lastAppliedIdx + 1; i <= mxRIdx; i++ {
+			rf.lf("leader apply mssgs: applying cmd: %v at idx: %d", rf.log[i-rf.offset()].Command, i)
+			rf.applyCh <- ApplyMsg{
+				CommandValid: rf.log[i-rf.offset()].CommandValid,
+				Command:      rf.log[i-rf.offset()].Command,
+				CommandIndex: i,
 			}
 		}
-
-		rf.mu.Unlock()
-		time.Sleep(heartbeatTimeSpan)
+		rf.commitIdx = mxRIdx
+		rf.lastAppliedIdx = mxRIdx
+	} else {
+		rf.lf("leader apply mssgs: no actions. maxReplicatedIdx: %d rf.commitIdx: %d", mxRIdx, rf.commitIdx)
 	}
 }
 
@@ -1045,8 +996,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.startLeaderLoop()
-
-	go rf.startApplyMssgLoop()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

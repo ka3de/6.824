@@ -1,13 +1,25 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"fmt"
+	"log"
+	"math/big"
+	"os"
+	"strings"
+	"sync/atomic"
 
+	"6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	debug bool
+
+	leaderID int32
+	clientID int64
+	reqID    int64
 }
 
 func nrand() int64 {
@@ -21,6 +33,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientID = nrand()
+	if strings.EqualFold(os.Getenv("KVRAFT_DBG"), "true") {
+		ck.debug = true
+	}
 	return ck
 }
 
@@ -37,9 +53,34 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	ck.lf("executing Get for k:%s", key)
+
+	args := GetArgs{
+		ClientID: ck.clientID,
+		ReqID:    atomic.AddInt64(&ck.reqID, 1),
+		Key:      key,
+	}
+
+	for i := atomic.LoadInt32(&ck.leaderID); ; i++ {
+		reply := Reply{}
+		srv := i % int32(len(ck.servers))
+
+		ok := ck.servers[srv].Call("KVServer.Get", &args, &reply)
+
+		if ok {
+			ck.lf("srv %d returned err: %s value: %v", srv, reply.Err, reply.Value)
+			if reply.Err == OK {
+				ck.leaderID = i
+				return reply.Value
+			} else if reply.Err == ErrNoKey {
+				ck.leaderID = i
+				return ""
+			}
+		} else {
+			ck.lf("srv %d could not be reached", srv)
+		}
+	}
 }
 
 //
@@ -54,6 +95,32 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.lf("executing %s for k:%s v:%s", op, key, value)
+
+	args := PutAppendArgs{
+		ClientID: ck.clientID,
+		ReqID:    atomic.AddInt64(&ck.reqID, 1),
+		Op:       op,
+		Key:      key,
+		Value:    value,
+	}
+
+	for i := atomic.LoadInt32(&ck.leaderID); ; i++ {
+		reply := Reply{}
+		srv := i % int32(len(ck.servers))
+
+		ok := ck.servers[srv].Call("KVServer.PutAppend", &args, &reply)
+
+		if ok {
+			ck.lf("srv %d returned %s", srv, reply.Err)
+			if reply.Err == OK {
+				ck.leaderID = i
+				return
+			}
+		} else {
+			ck.lf("srv %d could not be reached", srv)
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
@@ -61,4 +128,16 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+// l logs the given string s for.
+func (ck *Clerk) l(s string) {
+	if ck.debug {
+		log.Print("[CLIENT] ", s)
+	}
+}
+
+// lf logs the given string format with fields values.
+func (ck *Clerk) lf(format string, fields ...interface{}) {
+	ck.l(fmt.Sprintf(format, fields...))
 }

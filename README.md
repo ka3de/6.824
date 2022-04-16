@@ -7,5 +7,7 @@ Labs for [MIT 6.824 Distributed Systems 2021](http://nil.csail.mit.edu/6.824/202
     - [X] 2B: Log
     - [X] 2C: Persistence
     - [X] 2D: Log compaction
-- [ ] Lab 3: Fault-tolerant Key/Value Service
+- [X] Lab 3: Fault-tolerant Key/Value Service
+    - [X] 3A: Key/value service without snapshots
+    - [X] 3B: Key/value service with snapshots
 - [ ] Lab 4: Sharded Key/Value Service

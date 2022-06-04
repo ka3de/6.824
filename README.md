@@ -11,3 +11,5 @@ Labs for [MIT 6.824 Distributed Systems 2021](http://nil.csail.mit.edu/6.824/202
     - [X] 3A: Key/value service without snapshots
     - [X] 3B: Key/value service with snapshots
 - [ ] Lab 4: Sharded Key/Value Service
+    - [X] 4A: Shard controller
+    - [ ] 4B: Sharded key/value server
